@@ -102,6 +102,9 @@ Prints the resolved config and does a live `GET /api/students` call.
 | `COURSESTACK_INCLUDE_DEPRECATED` | `0` | `1` also exposes the deprecated `/api/enrollments` tools. |
 | `COURSESTACK_TIMEOUT_SECS` | `60` | HTTP request timeout. |
 | `COURSESTACK_OPENAPI` | *(embedded)* | Path to an OpenAPI document, to pick up API changes without a rebuild. |
+| `COURSESTACK_MAX_RETRIES` | `2` | Extra attempts on `429` (any method) or retryable `5xx` (`GET` only), with exponential backoff honoring `Retry-After`. |
+| `COURSESTACK_RETRY_BASE_MS` | `300` | Backoff base; doubles per attempt, capped at 8s (or the server's `Retry-After`, capped at 30s). |
+| `COURSESTACK_MAX_PAGES` | `20` | Default cap when a tool is called with `all_pages: true`. |
 
 ## What's exposed
 
@@ -132,6 +135,30 @@ File uploads are two calls, matching the API's own two-step design:
 
 1. `content_files_create` with the content metadata → returns a presigned URL.
 2. `coursestack_upload_file` with that URL and a local `file_path`.
+
+## Pagination
+
+The 8 list endpoints that expose a `next_key` cursor (`content_list`,
+`content_chapters_list`, `content_lessons_list`, `students_list`,
+`course_enrollments_list`, `bundle_enrollments_list`,
+`event_registrations_list`, and deprecated `enrollments_list`) accept two
+extra arguments:
+
+- `all_pages: true` — follow the cursor automatically, merging every page's
+  array fields into one result.
+- `max_pages` — cap on pages fetched (default `COURSESTACK_MAX_PAGES`, 20).
+
+The merged result adds `pages_fetched` and, if the cap was hit before the API
+ran out of pages, `truncated: true` — check for that rather than assuming
+you got everything back.
+
+## Reliability
+
+Requests retry automatically: `429` on any method, and retryable `5xx`
+(`500`/`502`/`503`/`504`) on `GET` only — writes aren't retried on `5xx`
+since a partial failure on the server side can't be told apart from success.
+Backoff is exponential from `COURSESTACK_RETRY_BASE_MS`, or follows the
+server's `Retry-After` header when present.
 
 ## Development
 
