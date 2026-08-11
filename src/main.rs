@@ -122,7 +122,7 @@ fn doctor() -> Result<(), String> {
             AuthMode::Basic => "HTTP Basic, key as username",
             AuthMode::Bearer => "Bearer token",
         },
-        &cfg.api_key.chars().take(5).collect::<String>(),
+        cfg.api_key.chars().take(5).collect::<String>(),
         cfg.api_key.len()
     );
     println!("read-only     {}", cfg.read_only);
