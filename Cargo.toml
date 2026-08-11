@@ -1,0 +1,31 @@
+[package]
+name = "coursestack-mcp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "MCP server for the CourseStack API (courses, content, lessons, enrollments, students, files)"
+license = "MIT"
+repository = "https://github.com/JoasASantos/Course-Stack-MCP"
+readme = "README.md"
+keywords = ["mcp", "coursestack", "llm", "claude", "api"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "coursestack-mcp"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
