@@ -174,6 +174,21 @@ impl Server {
             path = path.replace(&format!("{{{param}}}"), &percent_encode(&rendered));
         }
 
+        let all_pages = args
+            .get("all_pages")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if all_pages && !tool.paginated {
+            return Err(format!(
+                "tool `{name}` does not support pagination (no `next_key` cursor)"
+            ));
+        }
+        let max_pages = args
+            .get("max_pages")
+            .and_then(Value::as_u64)
+            .map(|v| v.max(1) as usize)
+            .unwrap_or(self.client.config().max_pages);
+
         let mut query = Map::new();
         for (key, value) in args {
             if tool.path_params.contains(key) || value.is_null() {
@@ -184,6 +199,9 @@ impl Server {
                     return Err(format!("tool `{name}` does not accept a request body"));
                 }
                 continue;
+            }
+            if key == "all_pages" || key == "max_pages" {
+                continue; // consumed above, never sent to CourseStack
             }
             if !tool.query_params.contains(key) {
                 return Err(format!(
@@ -205,6 +223,10 @@ impl Server {
             }
         }
 
+        if all_pages {
+            return self.paginate(tool.method, &path, query, max_pages);
+        }
+
         let response = self.client.call(tool.method, &path, &query, body)?;
         if response.is_error() {
             return Err(format!(
@@ -214,6 +236,68 @@ impl Server {
             ));
         }
         Ok(response.value)
+    }
+
+    /// Follow a `next_key` cursor until the API reports no more pages or
+    /// `max_pages` is hit, merging every page's array fields into one object.
+    fn paginate(
+        &self,
+        method: Method,
+        path: &str,
+        mut query: Map<String, Value>,
+        max_pages: usize,
+    ) -> Result<Value, String> {
+        let mut merged = Map::new();
+        let mut pages_fetched = 0usize;
+        let mut last_paging_info = Value::Null;
+        let mut truncated = false;
+
+        loop {
+            let response = self.client.call(method, path, &query, None)?;
+            if response.is_error() {
+                return Err(format!(
+                    "CourseStack returned HTTP {} while paginating (page {}): {}",
+                    response.status,
+                    pages_fetched + 1,
+                    serde_json::to_string_pretty(&response.value).unwrap_or_default()
+                ));
+            }
+            pages_fetched += 1;
+
+            let Some(body) = response.value.get("body").and_then(Value::as_object) else {
+                break; // empty/non-object body: nothing to merge or paginate further
+            };
+            merge_page(&mut merged, body);
+
+            let paging_info = body.get("paging_info").cloned().unwrap_or(Value::Null);
+            last_paging_info = paging_info.clone();
+            let next_key = next_page_key(&paging_info);
+
+            match next_key {
+                Some(key) if pages_fetched < max_pages => {
+                    query.insert("next_key".to_string(), Value::String(key));
+                }
+                Some(_) => {
+                    truncated = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        merged.insert("paging_info".to_string(), last_paging_info);
+        merged.insert(
+            "pages_fetched".to_string(),
+            Value::from(pages_fetched as u64),
+        );
+        if truncated {
+            merged.insert("truncated".to_string(), Value::Bool(true));
+        }
+        Ok(json!({
+            "status": 200,
+            "request": format!("{} {} (paginated, {pages_fetched} page(s))", method.as_str(), path),
+            "body": Value::Object(merged),
+        }))
     }
 
     fn raw_request(&self, args: &Map<String, Value>) -> Result<Value, String> {
@@ -272,11 +356,51 @@ fn accepted_args(tool: &ToolDef) -> String {
     if tool.takes_body {
         names.push("body");
     }
+    if tool.paginated {
+        names.push("all_pages");
+        names.push("max_pages");
+    }
     if names.is_empty() {
         "(none)".to_string()
     } else {
         names.join(", ")
     }
+}
+
+/// Merge one page's array-valued fields into the running total; scalar
+/// fields (other than `paging_info`, handled separately) keep their
+/// first-seen value.
+fn merge_page(merged: &mut Map<String, Value>, page: &Map<String, Value>) {
+    for (key, value) in page {
+        if key == "paging_info" {
+            continue;
+        }
+        match value {
+            Value::Array(items) => match merged.get_mut(key) {
+                Some(Value::Array(existing)) => existing.extend(items.clone()),
+                _ => {
+                    merged.insert(key.clone(), Value::Array(items.clone()));
+                }
+            },
+            other => {
+                merged.entry(key.clone()).or_insert_with(|| other.clone());
+            }
+        }
+    }
+}
+
+fn next_page_key(paging_info: &Value) -> Option<String> {
+    if !paging_info
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    paging_info
+        .get("next_key")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn tool_result(value: &Value, is_error: bool) -> Value {
@@ -358,6 +482,39 @@ mod tests {
     }
 
     #[test]
+    fn merge_page_concatenates_arrays_and_keeps_first_scalar() {
+        let mut merged = Map::new();
+        merge_page(
+            &mut merged,
+            json!({ "students": [{"id": 1}], "total_count": 2, "paging_info": {"has_more": true} })
+                .as_object()
+                .unwrap(),
+        );
+        merge_page(
+            &mut merged,
+            json!({ "students": [{"id": 2}], "total_count": 999, "paging_info": {"has_more": false} })
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(merged["students"], json!([{"id": 1}, {"id": 2}]));
+        assert_eq!(merged["total_count"], json!(2), "first-seen scalar wins");
+        assert!(
+            merged.get("paging_info").is_none(),
+            "paging_info is merged separately"
+        );
+    }
+
+    #[test]
+    fn next_page_key_respects_has_more() {
+        assert_eq!(
+            next_page_key(&json!({ "has_more": true, "next_key": "abc" })),
+            Some("abc".to_string())
+        );
+        assert_eq!(next_page_key(&json!({ "has_more": false })), None);
+        assert_eq!(next_page_key(&Value::Null), None);
+    }
+
+    #[test]
     fn notifications_get_no_response() {
         let spec = crate::spec::load_spec(None).unwrap();
         let tools = crate::spec::build_tools(&spec, false);
@@ -369,6 +526,9 @@ mod tests {
             read_only: true,
             include_deprecated: false,
             spec_path: None,
+            max_retries: 0,
+            retry_base_ms: 1,
+            max_pages: 20,
         };
         let server = Server::new(CourseStack::new(cfg).unwrap(), tools);
         assert!(server

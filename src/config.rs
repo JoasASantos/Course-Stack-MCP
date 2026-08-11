@@ -23,6 +23,11 @@ pub struct Config {
     pub read_only: bool,
     pub include_deprecated: bool,
     pub spec_path: Option<String>,
+    /// Extra attempts after the first, on top of 429 / retryable 5xx.
+    pub max_retries: u32,
+    pub retry_base_ms: u64,
+    /// Default page cap for tools called with `all_pages: true`.
+    pub max_pages: usize,
 }
 
 impl Config {
@@ -70,6 +75,19 @@ impl Config {
             spec_path: env::var("COURSESTACK_OPENAPI")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            max_retries: env::var("COURSESTACK_MAX_RETRIES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
+            retry_base_ms: env::var("COURSESTACK_RETRY_BASE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
+            max_pages: env::var("COURSESTACK_MAX_PAGES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(20),
         })
     }
 }

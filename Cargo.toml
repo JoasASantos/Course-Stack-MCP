@@ -1,6 +1,6 @@
 [package]
 name = "coursestack-mcp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.74"
 description = "MCP server for the CourseStack API (courses, content, lessons, enrollments, students, files)"

@@ -31,6 +31,9 @@ ENVIRONMENT:
     COURSESTACK_INCLUDE_DEPRECATED  `1` to also expose /api/enrollments (deprecated)
     COURSESTACK_TIMEOUT_SECS     Request timeout, default 60
     COURSESTACK_OPENAPI          Path to an OpenAPI document overriding the embedded one
+    COURSESTACK_MAX_RETRIES      Extra attempts on 429/retryable 5xx, default 2
+    COURSESTACK_RETRY_BASE_MS    Backoff base for retries, default 300
+    COURSESTACK_MAX_PAGES        Default page cap for all_pages=true, default 20
 "#;
 
 fn main() {
@@ -123,6 +126,14 @@ fn doctor() -> Result<(), String> {
         cfg.api_key.len()
     );
     println!("read-only     {}", cfg.read_only);
+    println!(
+        "retries       {} attempts, {}ms base backoff",
+        cfg.max_retries, cfg.retry_base_ms
+    );
+    println!(
+        "max pages     {} (all_pages=true default cap)",
+        cfg.max_pages
+    );
 
     let tools = load(&cfg)?;
     println!("tools         {}", tools.len() + 2);

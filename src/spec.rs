@@ -50,6 +50,9 @@ pub struct ToolDef {
     pub takes_body: bool,
     pub input_schema: Value,
     pub read_only_hint: bool,
+    /// True for list endpoints that expose a `next_key` cursor — these accept
+    /// the synthetic `all_pages` / `max_pages` arguments in server.rs.
+    pub paginated: bool,
 }
 
 pub fn load_spec(path: Option<&str>) -> Result<Value, String> {
@@ -200,6 +203,28 @@ fn build_tool(
         }
     }
 
+    let paginated = query_params.iter().any(|p| p == "next_key");
+    if paginated {
+        properties.insert(
+            "all_pages".to_string(),
+            json!({
+                "type": "boolean",
+                "description": "Follow `next_key` automatically, merging every page's array \
+                                 fields into one result. Default false (first page only)."
+            }),
+        );
+        properties.insert(
+            "max_pages".to_string(),
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "description": "Cap on pages fetched when all_pages is true. Defaults to \
+                                 COURSESTACK_MAX_PAGES (20)."
+            }),
+        );
+        description.push_str(" Supports all_pages=true to auto-fetch every page.");
+    }
+
     let input_schema = json!({
         "type": "object",
         "properties": Value::Object(properties),
@@ -217,6 +242,7 @@ fn build_tool(
         takes_body,
         input_schema,
         read_only_hint: method == Method::Get,
+        paginated,
     }
 }
 
@@ -318,6 +344,26 @@ mod tests {
             template_params("/api/content/{content_id}/lessons/{lesson_id}"),
             vec!["content_id".to_string(), "lesson_id".to_string()]
         );
+    }
+
+    #[test]
+    fn list_endpoints_expose_pagination_arguments() {
+        let spec = load_spec(None).unwrap();
+        let tools = build_tools(&spec, false);
+
+        let list = tools.iter().find(|t| t.name == "students_list").unwrap();
+        assert!(list.paginated);
+        assert!(list.input_schema["properties"].get("all_pages").is_some());
+        assert!(list.input_schema["properties"].get("max_pages").is_some());
+
+        let retrieve = tools
+            .iter()
+            .find(|t| t.name == "students_retrieve")
+            .unwrap();
+        assert!(!retrieve.paginated);
+        assert!(retrieve.input_schema["properties"]
+            .get("all_pages")
+            .is_none());
     }
 
     #[test]
