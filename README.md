@@ -105,6 +105,8 @@ Prints the resolved config and does a live `GET /api/students` call.
 | `COURSESTACK_MAX_RETRIES` | `2` | Extra attempts on `429` (any method) or retryable `5xx` (`GET` only), with exponential backoff honoring `Retry-After`. |
 | `COURSESTACK_RETRY_BASE_MS` | `300` | Backoff base; doubles per attempt, capped at 8s (or the server's `Retry-After`, capped at 30s). |
 | `COURSESTACK_MAX_PAGES` | `20` | Default cap when a tool is called with `all_pages: true`. |
+| `COURSESTACK_STRICT_VALIDATION` | `1` | `0` skips the client-side pre-flight checks (below) and lets CourseStack be the only validator. |
+| `COURSESTACK_DEBUG` | `0` | `1` logs method/URL/status/timing (never the key) to stderr. |
 
 ## What's exposed
 
@@ -122,12 +124,18 @@ Covers:
 
 Run `coursestack-mcp tools` to print the full list with HTTP method + path.
 
-Two extra tools are always available:
+Four extra tools are always available:
 
 - `coursestack_request` — call any path directly (escape hatch for endpoints
   added to the API before this tool catalog is regenerated).
 - `coursestack_upload_file` — PUT a local file to a presigned URL returned by
   the `*_files_create` / `*_jupyter_create` tools.
+- `students_find_by_email` — `students_list`'s `search` is a fuzzy match;
+  this filters down to the exact match(es) so an agent doesn't need a
+  follow-up round-trip to disambiguate.
+- `content_tree` — fetches a content item with every chapter and lesson
+  under it (auto-paginating both), lessons grouped by chapter, in one call.
+  Replaces `content_retrieve` + `content_chapters_list` + `content_lessons_list`.
 
 ## Uploading a file
 
@@ -159,6 +167,29 @@ Requests retry automatically: `429` on any method, and retryable `5xx`
 since a partial failure on the server side can't be told apart from success.
 Backoff is exponential from `COURSESTACK_RETRY_BASE_MS`, or follows the
 server's `Retry-After` header when present.
+
+## Client-side validation
+
+Every call is checked against the operation's OpenAPI schema before it goes
+out: required fields, UUID/email formats, enum membership, string/array
+length bounds. This is deliberately shallow — schemas too complex to check
+safely (the `oneOf` discriminated unions used for lesson content trees and
+network configs) are skipped rather than guessed, so a payload the API would
+accept is never rejected client-side. CourseStack's own response is always
+the final word; this just catches typos before a round-trip.
+
+Set `COURSESTACK_STRICT_VALIDATION=0` to turn it off entirely.
+
+## Troubleshooting
+
+`coursestack-mcp doctor` probes several resources, not just one — API keys
+can be scoped, so a `403` on `/api/students` doesn't mean the key is broken,
+just that it lacks that one permission. It only fails if every probe comes
+back `401` (the key itself is rejected).
+
+Set `COURSESTACK_DEBUG=1` to log every request's method, URL, status, and
+timing (never the key) to stderr — useful when a tool call fails and you
+need to see what was actually sent.
 
 ## Development
 

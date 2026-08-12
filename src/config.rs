@@ -28,6 +28,10 @@ pub struct Config {
     pub retry_base_ms: u64,
     /// Default page cap for tools called with `all_pages: true`.
     pub max_pages: usize,
+    /// Pre-flight schema checks (validate.rs) before sending a request.
+    pub strict_validation: bool,
+    /// Log method/URL/status/timing (never the key) to stderr.
+    pub debug: bool,
 }
 
 impl Config {
@@ -88,10 +92,17 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .filter(|v| *v > 0)
                 .unwrap_or(20),
+            strict_validation: !is_falsy("COURSESTACK_STRICT_VALIDATION"),
+            debug: is_truthy("COURSESTACK_DEBUG"),
         })
     }
 }
 
 fn is_truthy(key: &str) -> bool {
     matches!(env::var(key).as_deref(), Ok("1") | Ok("true") | Ok("yes"))
+}
+
+/// For opt-out flags that default to enabled.
+fn is_falsy(key: &str) -> bool {
+    matches!(env::var(key).as_deref(), Ok("0") | Ok("false") | Ok("no"))
 }

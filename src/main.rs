@@ -2,8 +2,9 @@ mod client;
 mod config;
 mod server;
 mod spec;
+mod validate;
 
-use serde_json::{Map, Value};
+use serde_json::Map;
 
 use client::CourseStack;
 use config::{AuthMode, Config, DEFAULT_BASE_URL};
@@ -34,6 +35,8 @@ ENVIRONMENT:
     COURSESTACK_MAX_RETRIES      Extra attempts on 429/retryable 5xx, default 2
     COURSESTACK_RETRY_BASE_MS    Backoff base for retries, default 300
     COURSESTACK_MAX_PAGES        Default page cap for all_pages=true, default 20
+    COURSESTACK_STRICT_VALIDATION  `0` to skip client-side pre-flight checks, default on
+    COURSESTACK_DEBUG            `1` to log method/URL/status/timing to stderr
 "#;
 
 fn main() {
@@ -104,12 +107,17 @@ fn list_tools() -> Result<(), String> {
             tool.path
         );
     }
-    println!("{:<38} {:<6} <any path>", "coursestack_request", "ANY");
-    println!(
-        "{:<38} {:<6} <presigned url>",
-        "coursestack_upload_file", "PUT"
-    );
-    println!("\n{} tools", tools.len() + 2);
+    let builtins = server::builtin_tool_descriptors();
+    for b in &builtins {
+        let name = b["name"].as_str().unwrap_or("?");
+        let hint = if b["annotations"]["readOnlyHint"].as_bool().unwrap_or(false) {
+            "(read-only helper)"
+        } else {
+            "(escape hatch / helper)"
+        };
+        println!("{name:<38} {:<6} {hint}", "-");
+    }
+    println!("\n{} tools", tools.len() + builtins.len());
     Ok(())
 }
 
@@ -136,22 +144,46 @@ fn doctor() -> Result<(), String> {
     );
 
     let tools = load(&cfg)?;
-    println!("tools         {}", tools.len() + 2);
+    println!(
+        "tools         {}",
+        tools.len() + server::builtin_tool_descriptors().len()
+    );
 
     let client = CourseStack::new(cfg)?;
-    let mut query = Map::new();
-    query.insert("page_size".to_string(), Value::String("1".to_string()));
-    let response = client.call(Method::Get, "/api/students", &query, None)?;
 
-    if response.is_error() {
-        println!("\nGET /api/students -> HTTP {}", response.status);
-        return Err(format!(
-            "credentials rejected or endpoint unavailable:\n{}",
-            serde_json::to_string_pretty(&response.value).unwrap_or_default()
-        ));
+    // Probe several resources rather than just one: CourseStack keys can be
+    // scoped, so one endpoint (403) doesn't tell you about the rest.
+    const PROBES: &[(&str, &str)] = &[
+        ("/api/students", "students"),
+        ("/api/content", "content"),
+        ("/api/course-enrollments", "course enrollments"),
+        ("/api/bundle-enrollments", "bundle enrollments"),
+        ("/api/event-registrations", "event registrations"),
+    ];
+    println!();
+    let mut unauthenticated = 0;
+    for (path, label) in PROBES {
+        let response = client.call(Method::Get, path, &Map::new(), None)?;
+        let verdict = match response.status {
+            200..=299 => "ok",
+            400 => "ok (auth passed; endpoint needs query params this probe didn't send)",
+            401 => {
+                unauthenticated += 1;
+                "INVALID CREDENTIALS"
+            }
+            403 => "forbidden (key lacks permission for this resource)",
+            other => return Err(format!("unexpected HTTP {other} probing {path}")),
+        };
+        println!(
+            "GET {path:<28} -> HTTP {:<3} {verdict} [{label}]",
+            response.status
+        );
     }
-    println!("\nGET /api/students -> HTTP {} OK", response.status);
-    println!("connection healthy");
+
+    if unauthenticated == PROBES.len() {
+        return Err("every probe returned 401: the API key itself is rejected".to_string());
+    }
+    println!("\nconnection healthy (key is recognized by CourseStack)");
     Ok(())
 }
 

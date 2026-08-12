@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde_json::{json, Map, Value};
@@ -89,6 +89,10 @@ impl CourseStack {
             req = req.json(b);
         }
 
+        if self.cfg.debug {
+            eprintln!("[coursestack] -> {} {url}", method.as_str());
+        }
+
         // `req` is only ever sent through a clone, so the same template can be
         // resent verbatim on retry. JSON bodies are buffered, so try_clone()
         // never fails here (it only fails for streaming bodies, which we don't use).
@@ -97,22 +101,37 @@ impl CourseStack {
             let this_req = req.try_clone().ok_or_else(|| {
                 "internal error: request could not be cloned for retry".to_string()
             })?;
+            let started = Instant::now();
 
             match this_req.send() {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
+                    if self.cfg.debug {
+                        eprintln!(
+                            "[coursestack] <- {status} {url} in {}ms (attempt {})",
+                            started.elapsed().as_millis(),
+                            attempt + 1
+                        );
+                    }
                     let can_retry = attempt + 1 < max_attempts && should_retry(method, status);
                     if can_retry {
-                        std::thread::sleep(backoff_duration(
-                            attempt,
-                            retry_after(&resp),
-                            self.cfg.retry_base_ms,
-                        ));
+                        let wait =
+                            backoff_duration(attempt, retry_after(&resp), self.cfg.retry_base_ms);
+                        if self.cfg.debug {
+                            eprintln!("[coursestack] retrying in {}ms", wait.as_millis());
+                        }
+                        std::thread::sleep(wait);
                         continue;
                     }
                     return Ok(Self::finish(method, &url, resp));
                 }
                 Err(e) => {
+                    if self.cfg.debug {
+                        eprintln!(
+                            "[coursestack] xx {url} failed after {}ms: {e}",
+                            started.elapsed().as_millis()
+                        );
+                    }
                     let can_retry = attempt + 1 < max_attempts && method == Method::Get;
                     if can_retry {
                         std::thread::sleep(backoff_duration(attempt, None, self.cfg.retry_base_ms));

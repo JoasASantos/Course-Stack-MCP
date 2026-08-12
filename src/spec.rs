@@ -53,6 +53,9 @@ pub struct ToolDef {
     /// True for list endpoints that expose a `next_key` cursor — these accept
     /// the synthetic `all_pages` / `max_pages` arguments in server.rs.
     pub paginated: bool,
+    /// Per-argument schema (path/query params by name, JSON body under
+    /// `"body"`), used for the pre-flight checks in `validate.rs`.
+    pub param_schemas: Map<String, Value>,
 }
 
 pub fn load_spec(path: Option<&str>) -> Result<Value, String> {
@@ -225,6 +228,7 @@ fn build_tool(
         description.push_str(" Supports all_pages=true to auto-fetch every page.");
     }
 
+    let param_schemas = properties.clone();
     let input_schema = json!({
         "type": "object",
         "properties": Value::Object(properties),
@@ -243,6 +247,7 @@ fn build_tool(
         input_schema,
         read_only_hint: method == Method::Get,
         paginated,
+        param_schemas,
     }
 }
 

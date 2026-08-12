@@ -4,6 +4,7 @@ use serde_json::{json, Map, Value};
 
 use crate::client::CourseStack;
 use crate::spec::{Method, ToolDef};
+use crate::validate;
 
 pub const SUPPORTED_PROTOCOL: &str = "2025-06-18";
 const SERVER_NAME: &str = "coursestack-mcp";
@@ -145,6 +146,8 @@ impl Server {
         let outcome = match name {
             "coursestack_request" => self.raw_request(&args),
             "coursestack_upload_file" => self.upload_file(&args),
+            "students_find_by_email" => self.find_student_by_email(&args),
+            "content_tree" => self.content_tree(&args),
             _ => self.call_endpoint(name, &args),
         };
 
@@ -160,6 +163,22 @@ impl Server {
             .iter()
             .find(|t| t.name == name)
             .ok_or_else(|| format!("unknown tool `{name}`"))?;
+
+        if self.client.config().strict_validation {
+            let mut errors = Vec::new();
+            for (key, schema) in &tool.param_schemas {
+                if let Some(value) = args.get(key) {
+                    errors.extend(validate::validate(schema, value, key));
+                }
+            }
+            if !errors.is_empty() {
+                return Err(format!(
+                    "pre-flight validation failed for `{name}` (this is a client-side check; \
+                     set COURSESTACK_STRICT_VALIDATION=0 to skip it and let CourseStack decide):\n- {}",
+                    errors.join("\n- ")
+                ));
+            }
+        }
 
         let mut path = tool.path.clone();
         for param in &tool.path_params {
@@ -343,6 +362,122 @@ impl Server {
         let content_type = args.get("content_type").and_then(Value::as_str);
         self.client.upload(url, file, content_type)
     }
+
+    /// Convenience wrapper over `students_list?search=<email>`: does the
+    /// exact-match filtering an agent would otherwise need a follow-up
+    /// round-trip for (the API's `search` is a substring/fuzzy match).
+    fn find_student_by_email(&self, args: &Map<String, Value>) -> Result<Value, String> {
+        let email = args
+            .get("email")
+            .and_then(Value::as_str)
+            .ok_or("missing `email`")?;
+
+        let mut query = Map::new();
+        query.insert("search".to_string(), Value::String(email.to_string()));
+        let response = self
+            .client
+            .call(Method::Get, "/api/students", &query, None)?;
+        if response.is_error() {
+            return Err(format!(
+                "CourseStack returned HTTP {}: {}",
+                response.status,
+                serde_json::to_string_pretty(&response.value).unwrap_or_default()
+            ));
+        }
+
+        let candidates = response
+            .value
+            .get("body")
+            .and_then(|b| b.get("students"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let matches: Vec<Value> = candidates
+            .into_iter()
+            .filter(|s| {
+                s.get("user_email")
+                    .and_then(Value::as_str)
+                    .is_some_and(|e| e.eq_ignore_ascii_case(email))
+            })
+            .collect();
+
+        Ok(json!({
+            "email": email,
+            "match_count": matches.len(),
+            "student": if matches.len() == 1 { matches[0].clone() } else { Value::Null },
+            "matches": matches,
+        }))
+    }
+
+    /// Fetches a content item together with every chapter and lesson under
+    /// it (auto-paginating both) in one call, grouping lessons by chapter —
+    /// three round-trips and the grouping an agent would otherwise redo itself.
+    fn content_tree(&self, args: &Map<String, Value>) -> Result<Value, String> {
+        let content_id = args
+            .get("content_id")
+            .and_then(Value::as_str)
+            .ok_or("missing `content_id`")?;
+        let max_pages = args
+            .get("max_pages")
+            .and_then(Value::as_u64)
+            .map(|v| v.max(1) as usize)
+            .unwrap_or(self.client.config().max_pages);
+
+        let content_path = format!("/api/content/{}", percent_encode(content_id));
+        let content_resp = self
+            .client
+            .call(Method::Get, &content_path, &Map::new(), None)?;
+        if content_resp.is_error() {
+            return Err(format!(
+                "CourseStack returned HTTP {} fetching content: {}",
+                content_resp.status,
+                serde_json::to_string_pretty(&content_resp.value).unwrap_or_default()
+            ));
+        }
+
+        let chapters_path = format!("{content_path}/chapters");
+        let chapters = self.paginate(Method::Get, &chapters_path, Map::new(), max_pages)?;
+
+        let lessons_path = format!("{content_path}/lessons");
+        let lessons = self.paginate(Method::Get, &lessons_path, Map::new(), max_pages)?;
+
+        let chapter_list = chapters["body"]["chapters"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let lesson_list = lessons["body"]["lessons"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+
+        let by_chapter = |chapter_id: Option<&str>| -> Vec<Value> {
+            lesson_list
+                .iter()
+                .filter(|l| l.get("chapter_id").and_then(Value::as_str) == chapter_id)
+                .cloned()
+                .collect()
+        };
+
+        let chapters_with_lessons: Vec<Value> = chapter_list
+            .iter()
+            .map(|c| {
+                let mut c = c.clone();
+                let id = c.get("id").and_then(Value::as_str).map(str::to_string);
+                c["lessons"] = Value::Array(by_chapter(id.as_deref()));
+                c
+            })
+            .collect();
+        let unassigned = by_chapter(None);
+
+        Ok(json!({
+            "content": content_resp.value["body"]["content"],
+            "chapters": chapters_with_lessons,
+            "unassigned_lessons": unassigned,
+            "chapters_truncated": chapters["body"]["truncated"].as_bool().unwrap_or(false),
+            "lessons_truncated": lessons["body"]["truncated"].as_bool().unwrap_or(false),
+        }))
+    }
 }
 
 struct JsonRpcError {
@@ -468,6 +603,37 @@ pub fn builtin_tool_descriptors() -> Vec<Value> {
             },
             "annotations": { "readOnlyHint": false }
         }),
+        json!({
+            "name": "students_find_by_email",
+            "description": "Exact-match student lookup by email — students_list's `search` is \
+                            fuzzy, this filters the results down to the real match(es) so an \
+                            agent doesn't have to.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "email": { "type": "string", "format": "email" } },
+                "required": ["email"]
+            },
+            "annotations": { "readOnlyHint": true }
+        }),
+        json!({
+            "name": "content_tree",
+            "description": "Fetch a content item with every chapter and lesson under it in one \
+                            call (auto-paginating both), lessons grouped by chapter. Replaces \
+                            content_retrieve + content_chapters_list + content_lessons_list.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content_id": { "type": "string", "format": "uuid" },
+                    "max_pages": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Cap on pages fetched per list. Defaults to COURSESTACK_MAX_PAGES (20)."
+                    }
+                },
+                "required": ["content_id"]
+            },
+            "annotations": { "readOnlyHint": true }
+        }),
     ]
 }
 
@@ -529,6 +695,8 @@ mod tests {
             max_retries: 0,
             retry_base_ms: 1,
             max_pages: 20,
+            strict_validation: true,
+            debug: false,
         };
         let server = Server::new(CourseStack::new(cfg).unwrap(), tools);
         assert!(server
